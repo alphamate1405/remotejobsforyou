@@ -322,6 +322,308 @@ def start_webhook_server():
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    global bot_app
+    init_db()
+
+    # Start webhook HTTP server in background thread
+    t = threading.Thread(target=start_webhook_server, daemon=True)
+    t.start()
+
+    # Start Telegram bot
+    bot_app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+    bot_app.add_handler(CommandHandler("start",  start))
+    bot_app.add_handler(CommandHandler("status", status_cmd))
+    bot_app.add_handler(CommandHandler("help",   help_cmd))
+
+    log.info("Bot is running... Press Ctrl+C to stop.")
+    bot_app.run_polling()    con.execute("""
+        CREATE TABLE IF NOT EXISTS subscribers (
+            telegram_id     INTEGER PRIMARY KEY,
+            username        TEXT,
+            subscription_id TEXT,
+            status          TEXT DEFAULT 'pending',
+            email           TEXT,
+            joined_at       TEXT,
+            expires_at      TEXT
+        )
+    """)
+    con.commit()
+    con.close()
+
+def upsert_subscriber(telegram_id, username=None, subscription_id=None,
+                      status=None, email=None, expires_at=None):
+    con = sqlite3.connect(DB_PATH)
+    con.execute("""
+        INSERT INTO subscribers (telegram_id, username, subscription_id, status, email, joined_at, expires_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(telegram_id) DO UPDATE SET
+            username        = COALESCE(excluded.username, username),
+            subscription_id = COALESCE(excluded.subscription_id, subscription_id),
+            status          = COALESCE(excluded.status, status),
+            email           = COALESCE(excluded.email, email),
+            expires_at      = COALESCE(excluded.expires_at, expires_at)
+    """, (telegram_id, username, subscription_id, status, email,
+          datetime.now(timezone.utc).isoformat(), expires_at))
+    con.commit()
+    con.close()
+
+def get_subscriber_by_sub_id(subscription_id):
+    con = sqlite3.connect(DB_PATH)
+    row = con.execute(
+        "SELECT * FROM subscribers WHERE subscription_id = ?", (subscription_id,)
+    ).fetchone()
+    con.close()
+    return row
+
+def set_status(subscription_id, status, expires_at=None):
+    con = sqlite3.connect(DB_PATH)
+    if expires_at:
+        con.execute(
+            "UPDATE subscribers SET status=?, expires_at=? WHERE subscription_id=?",
+            (status, expires_at, subscription_id)
+        )
+    else:
+        con.execute(
+            "UPDATE subscribers SET status=? WHERE subscription_id=?",
+            (status, subscription_id)
+        )
+    con.commit()
+    con.close()
+
+# ── DODO PAYMENTS HELPERS ─────────────────────────────────────────────────────
+DODO_BASE = "https://api.dodopayments.com"
+
+def create_payment_link(telegram_id: int, username: str) -> str:
+    """Creates a Dodo Payments subscription checkout link."""
+    url = f"{DODO_BASE}/subscriptions"
+    payload = json.dumps({
+        "product_id": DODO_PRODUCT_ID,
+        "quantity": 1,
+        "payment_link": True,
+        "metadata": {
+            "telegram_id": str(telegram_id),
+            "telegram_username": username or ""
+        },
+        "return_url": "https://t.me/" + TELEGRAM_CHANNEL_ID.lstrip("@")
+    }).encode()
+
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {DODO_API_KEY}",
+            "Content-Type": "application/json"
+        },
+        method="POST"
+    )
+    with urllib.request.urlopen(req) as resp:
+        data = json.loads(resp.read())
+    return data.get("payment_link", data.get("url", ""))
+
+def verify_webhook_signature(raw_body: bytes, signature: str) -> bool:
+    expected = hmac.new(
+        DODO_WEBHOOK_SECRET.encode(), raw_body, hashlib.sha256
+    ).hexdigest()
+    return hmac.compare_digest(expected, signature.split("=")[-1])
+
+# ── TELEGRAM BOT COMMANDS ─────────────────────────────────────────────────────
+async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    msg = (
+        f"👋 Welcome, {user.first_name}!\n\n"
+        "🔔 *Jobs Channel Subscription*\n\n"
+        "Get access to *hand-picked job opportunities* delivered directly to your Telegram every day.\n\n"
+        "💰 *Price:* ₹499/month (recurring)\n"
+        "✅ Cancel anytime\n\n"
+        "Tap the button below to subscribe:"
+    )
+    try:
+        link = create_payment_link(user.id, user.username or user.first_name)
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("💳 Subscribe Now — ₹499/month", url=link)
+        ]])
+        await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=keyboard)
+        upsert_subscriber(user.id, user.username, status="pending")
+    except Exception as e:
+        log.error(f"Error creating payment link: {e}")
+        await update.message.reply_text(
+            "Sorry, something went wrong generating your payment link. Please try again in a moment."
+        )
+
+async def status_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    con = sqlite3.connect(DB_PATH)
+    row = con.execute(
+        "SELECT status, expires_at FROM subscribers WHERE telegram_id=?", (user.id,)
+    ).fetchone()
+    con.close()
+
+    if not row:
+        await update.message.reply_text(
+            "You don't have a subscription yet. Use /start to subscribe!"
+        )
+    elif row[0] == "active":
+        await update.message.reply_text(
+            f"✅ Your subscription is *active*!\nRenews on: {row[1] or 'auto-renew'}",
+            parse_mode="Markdown"
+        )
+    else:
+        await update.message.reply_text(
+            f"❌ Your subscription status is: *{row[0]}*\n\nUse /start to resubscribe.",
+            parse_mode="Markdown"
+        )
+
+async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🤖 *Jobs Channel Bot*\n\n"
+        "/start — Subscribe to the channel\n"
+        "/status — Check your subscription\n"
+        "/help — Show this message",
+        parse_mode="Markdown"
+    )
+
+# ── WEBHOOK SERVER (receives Dodo Payments events) ────────────────────────────
+bot_app = None  # set after build
+
+class WebhookHandler(BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        log.info(f"Webhook: {format % args}")
+
+    def do_POST(self):
+        if self.path != "/webhook":
+            self.send_response(404); self.end_headers(); return
+
+        length = int(self.headers.get("Content-Length", 0))
+        raw = self.rfile.read(length)
+        sig = self.headers.get("dodo-signature", "")
+
+        if DODO_WEBHOOK_SECRET != "YOUR_WEBHOOK_SECRET":
+            if not verify_webhook_signature(raw, sig):
+                log.warning("Invalid webhook signature — rejected")
+                self.send_response(401); self.end_headers(); return
+
+        try:
+            event = json.loads(raw)
+            handle_dodo_event(event)
+        except Exception as e:
+            log.error(f"Webhook handling error: {e}")
+
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(b'{"received":true}')
+
+def handle_dodo_event(event: dict):
+    etype = event.get("type", "")
+    data  = event.get("data", {})
+    sub_id = data.get("subscription_id") or data.get("id")
+    meta   = data.get("metadata", {})
+    telegram_id = int(meta.get("telegram_id", 0)) if meta.get("telegram_id") else None
+
+    log.info(f"Dodo event: {etype} | sub={sub_id} | tg={telegram_id}")
+
+    if etype == "subscription.created":
+        if telegram_id:
+            upsert_subscriber(
+                telegram_id,
+                meta.get("telegram_username"),
+                subscription_id=sub_id,
+                status="active",
+                email=data.get("customer", {}).get("email"),
+                expires_at=data.get("next_billing_date")
+            )
+            _send_message(telegram_id,
+                "🎉 *Payment successful!*\n\n"
+                "You now have full access to the Jobs Channel.\n"
+                "Your subscription renews automatically every month.\n\n"
+                "👉 Join now: " + f"https://t.me/{TELEGRAM_CHANNEL_ID.lstrip('@')}"
+            )
+            _create_invite_and_send(telegram_id)
+
+    elif etype in ("subscription.renewed", "subscription.updated"):
+        if sub_id:
+            set_status(sub_id, "active", data.get("next_billing_date"))
+            if telegram_id:
+                _send_message(telegram_id,
+                    "✅ Your subscription has been renewed! Enjoy continued access to the Jobs Channel."
+                )
+
+    elif etype in ("subscription.cancelled", "subscription.expired"):
+        if sub_id:
+            set_status(sub_id, "cancelled")
+            row = get_subscriber_by_sub_id(sub_id)
+            if row:
+                tg_id = row[0]
+                _kick_from_channel(tg_id)
+                _send_message(tg_id,
+                    "😔 Your subscription has ended and you've been removed from the channel.\n\n"
+                    "You can resubscribe anytime with /start"
+                )
+
+    elif etype == "payment.failed":
+        if telegram_id:
+            _send_message(telegram_id,
+                "⚠️ Your payment failed. Please update your payment method to keep access.\n\n"
+                "Use /start to get a new payment link."
+            )
+
+def _send_message(chat_id: int, text: str):
+    """Send a Telegram message via HTTP (no async needed here)."""
+    if not bot_app:
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = json.dumps({
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "Markdown"
+    }).encode()
+    try:
+        req = urllib.request.Request(url, data=payload,
+            headers={"Content-Type": "application/json"}, method="POST")
+        urllib.request.urlopen(req)
+    except Exception as e:
+        log.error(f"Send message error: {e}")
+
+def _create_invite_and_send(telegram_id: int):
+    """Create a one-time invite link for the subscriber."""
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/createChatInviteLink"
+    payload = json.dumps({
+        "chat_id": TELEGRAM_CHANNEL_ID,
+        "member_limit": 1,
+        "name": f"sub_{telegram_id}"
+    }).encode()
+    try:
+        req = urllib.request.Request(url, data=payload,
+            headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req) as resp:
+            data = json.loads(resp.read())
+        invite = data["result"]["invite_link"]
+        _send_message(telegram_id, f"🔗 Your private invite link:\n{invite}\n\n_This link is for you only — do not share it._")
+    except Exception as e:
+        log.error(f"Invite link error: {e}")
+
+def _kick_from_channel(telegram_id: int):
+    """Ban then unban (kick) user from channel."""
+    for method in ("banChatMember", "unbanChatMember"):
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
+        payload = json.dumps({
+            "chat_id": TELEGRAM_CHANNEL_ID,
+            "user_id": telegram_id
+        }).encode()
+        try:
+            req = urllib.request.Request(url, data=payload,
+                headers={"Content-Type": "application/json"}, method="POST")
+            urllib.request.urlopen(req)
+        except Exception as e:
+            log.error(f"{method} error: {e}")
+
+def start_webhook_server():
+    server = HTTPServer(("0.0.0.0", WEBHOOK_PORT), WebhookHandler)
+    log.info(f"Webhook server listening on port {WEBHOOK_PORT}")
+    server.serve_forever()
+
+# ── MAIN ──────────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
     init_db()
 
     # Start webhook HTTP server in background thread
