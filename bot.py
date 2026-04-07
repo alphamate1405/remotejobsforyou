@@ -9,9 +9,9 @@ from datetime import datetime, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import threading
 import requests
-
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+import urllib3
 
 TELEGRAM_BOT_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN")
 TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "@your_channel")
@@ -26,6 +26,30 @@ log = logging.getLogger(__name__)
 bot_app = None
 DB_PATH = "subscribers.db"
 
+# ── FORCE GOOGLE DNS FOR DODO ─────────────────────────────────────────────────
+_original_getaddrinfo = socket.getaddrinfo
+
+def _patched_getaddrinfo(host, port, *args, **kwargs):
+    if host == "api.dodopayments.com":
+        try:
+            import urllib.request
+            # resolve using Google DNS over HTTPS
+            url = f"https://dns.google/resolve?name={host}&type=A"
+            req = urllib.request.Request(url, headers={"accept": "application/dns-json"})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read())
+            ip = data["Answer"][0]["data"]
+            log.info(f"Resolved {host} via Google DoH -> {ip}")
+            return _original_getaddrinfo(ip, port, *args, **kwargs)
+        except Exception as e:
+            log.error(f"Google DoH resolution failed: {e}")
+    return _original_getaddrinfo(host, port, *args, **kwargs)
+
+socket.getaddrinfo = _patched_getaddrinfo
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+
 
 def test_network():
     log.info("=== NETWORK DIAGNOSTICS ===")
@@ -35,12 +59,6 @@ def test_network():
             log.info(f"DNS OK: {host} -> {ip}")
         except Exception as e:
             log.error(f"DNS FAILED: {host} -> {e}")
-    for url in ["https://httpbin.org/get", "https://api.telegram.org"]:
-        try:
-            r = requests.get(url, timeout=10)
-            log.info(f"HTTP OK: {url} -> {r.status_code}")
-        except Exception as e:
-            log.error(f"HTTP FAILED: {url} -> {e}")
     log.info("=== END DIAGNOSTICS ===")
 
 
@@ -226,7 +244,7 @@ def handle_dodo_event(event):
             set_status(sub_id, "on_hold")
             row = get_subscriber_by_sub_id(sub_id)
             if row:
-                _send_message(row[0], "⚠️ Subscription *on hold* due to payment issue. Please update your payment method.")
+                _send_message(row[0], "⚠️ Subscription *on hold*. Please update your payment method.")
     elif etype == "subscription.failed":
         if sub_id:
             set_status(sub_id, "failed")
