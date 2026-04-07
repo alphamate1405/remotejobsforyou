@@ -7,7 +7,7 @@ import logging
 from datetime import datetime, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import threading
-import urllib.request
+import requests
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
@@ -88,24 +88,26 @@ def set_status(subscription_id, status, expires_at=None):
 DODO_BASE = "https://api.dodopayments.com"
 
 def create_payment_link(telegram_id, username):
-    url = f"{DODO_BASE}/subscriptions"
-    payload = json.dumps({
-        "product_id": DODO_PRODUCT_ID,
-        "quantity": 1,
-        "payment_link": True,
-        "metadata": {
-            "telegram_id": str(telegram_id),
-            "telegram_username": username or ""
+    resp = requests.post(
+        f"{DODO_BASE}/subscriptions",
+        headers={
+            "Authorization": f"Bearer {DODO_API_KEY}",
+            "Content-Type": "application/json"
         },
-        "return_url": "https://t.me/" + TELEGRAM_CHANNEL_ID.lstrip("@")
-    }).encode()
-    req = urllib.request.Request(
-        url, data=payload,
-        headers={"Authorization": f"Bearer {DODO_API_KEY}", "Content-Type": "application/json"},
-        method="POST"
+        json={
+            "product_id": DODO_PRODUCT_ID,
+            "quantity": 1,
+            "payment_link": True,
+            "metadata": {
+                "telegram_id": str(telegram_id),
+                "telegram_username": username or ""
+            },
+            "return_url": "https://t.me/" + TELEGRAM_CHANNEL_ID.lstrip("@")
+        },
+        timeout=15
     )
-    with urllib.request.urlopen(req) as resp:
-        data = json.loads(resp.read())
+    resp.raise_for_status()
+    data = resp.json()
     return data.get("payment_link") or data.get("url", "")
 
 def verify_webhook_signature(raw_body, signature):
@@ -210,7 +212,6 @@ def handle_dodo_event(event):
     log.info(f"Dodo event: {etype} | sub={sub_id} | tg={telegram_id}")
 
     if etype == "subscription.active":
-        # Fired when a new subscription is created and payment succeeds
         if telegram_id:
             upsert_subscriber(
                 telegram_id,
@@ -228,7 +229,6 @@ def handle_dodo_event(event):
             _create_invite_and_send(telegram_id)
 
     elif etype == "subscription.renewed":
-        # Fired on every successful recurring charge
         if sub_id:
             set_status(sub_id, "active", data.get("next_billing_date"))
             if telegram_id:
@@ -237,13 +237,11 @@ def handle_dodo_event(event):
                 )
 
     elif etype == "subscription.updated":
-        # General update — sync status in case it changed
         if sub_id:
             new_status = data.get("status", "active")
             set_status(sub_id, new_status, data.get("next_billing_date"))
 
     elif etype == "subscription.plan_changed":
-        # Plan was upgraded/downgraded — keep them active
         if sub_id:
             set_status(sub_id, "active", data.get("next_billing_date"))
             if telegram_id:
@@ -252,7 +250,6 @@ def handle_dodo_event(event):
                 )
 
     elif etype == "subscription.on_hold":
-        # Payment issue — warn user but don't kick yet
         if sub_id:
             set_status(sub_id, "on_hold")
             row = get_subscriber_by_sub_id(sub_id)
@@ -260,11 +257,10 @@ def handle_dodo_event(event):
                 _send_message(row[0],
                     "⚠️ Your subscription is *on hold* due to a payment issue.\n\n"
                     "Please update your payment method soon or you'll lose access.\n"
-                    "Use /start to get a new payment link.",
+                    "Use /start to get a new payment link."
                 )
 
     elif etype == "subscription.failed":
-        # Payment failed — warn user
         if sub_id:
             set_status(sub_id, "failed")
             row = get_subscriber_by_sub_id(sub_id)
@@ -276,7 +272,6 @@ def handle_dodo_event(event):
                 )
 
     elif etype in ("subscription.cancelled", "subscription.expired"):
-        # Kick user from channel
         if sub_id:
             set_status(sub_id, etype.split(".")[1])
             row = get_subscriber_by_sub_id(sub_id)
@@ -289,32 +284,23 @@ def handle_dodo_event(event):
                 )
 
 def _send_message(chat_id, text):
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = json.dumps({"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}).encode()
     try:
-        req = urllib.request.Request(
-            url, data=payload,
-            headers={"Content-Type": "application/json"}, method="POST"
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"},
+            timeout=10
         )
-        urllib.request.urlopen(req)
     except Exception as e:
         log.error(f"Send message error: {e}")
 
 def _create_invite_and_send(telegram_id):
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/createChatInviteLink"
-    payload = json.dumps({
-        "chat_id": TELEGRAM_CHANNEL_ID,
-        "member_limit": 1,
-        "name": f"sub_{telegram_id}"
-    }).encode()
     try:
-        req = urllib.request.Request(
-            url, data=payload,
-            headers={"Content-Type": "application/json"}, method="POST"
+        resp = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/createChatInviteLink",
+            json={"chat_id": TELEGRAM_CHANNEL_ID, "member_limit": 1, "name": f"sub_{telegram_id}"},
+            timeout=10
         )
-        with urllib.request.urlopen(req) as resp:
-            data = json.loads(resp.read())
-        invite = data["result"]["invite_link"]
+        invite = resp.json()["result"]["invite_link"]
         _send_message(telegram_id,
             f"🔗 Your private invite link:\n{invite}\n\n"
             "_This link is for you only — do not share it._"
@@ -324,14 +310,12 @@ def _create_invite_and_send(telegram_id):
 
 def _kick_from_channel(telegram_id):
     for method in ("banChatMember", "unbanChatMember"):
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
-        payload = json.dumps({"chat_id": TELEGRAM_CHANNEL_ID, "user_id": telegram_id}).encode()
         try:
-            req = urllib.request.Request(
-                url, data=payload,
-                headers={"Content-Type": "application/json"}, method="POST"
+            requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}",
+                json={"chat_id": TELEGRAM_CHANNEL_ID, "user_id": telegram_id},
+                timeout=10
             )
-            urllib.request.urlopen(req)
         except Exception as e:
             log.error(f"{method} error: {e}")
 
