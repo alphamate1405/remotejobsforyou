@@ -342,7 +342,6 @@ def start_webhook_server():
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    global bot_app
     init_db()
 
     t = threading.Thread(target=start_webhook_server, daemon=True)
