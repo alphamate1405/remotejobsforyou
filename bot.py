@@ -4,20 +4,19 @@ import hmac
 import hashlib
 import json
 import logging
-import socket
 from datetime import datetime, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import threading
 import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-import urllib3
+import dodopayments
+from dodopayments import DodoPayments
 
 TELEGRAM_BOT_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN")
 TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "@your_channel")
 DODO_API_KEY        = os.getenv("DODO_API_KEY", "YOUR_DODO_API_KEY")
 DODO_PRODUCT_ID     = os.getenv("DODO_PRODUCT_ID", "YOUR_DODO_PRODUCT_ID")
 DODO_WEBHOOK_SECRET = os.getenv("DODO_WEBHOOK_SECRET", "YOUR_WEBHOOK_SECRET")
+DODO_ENV            = os.getenv("DODO_ENV", "live_mode")
 WEBHOOK_PORT        = int(os.getenv("WEBHOOK_PORT", "8080"))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -26,40 +25,7 @@ log = logging.getLogger(__name__)
 bot_app = None
 DB_PATH = "subscribers.db"
 
-# ── FORCE GOOGLE DNS FOR DODO ─────────────────────────────────────────────────
-_original_getaddrinfo = socket.getaddrinfo
-
-def _patched_getaddrinfo(host, port, *args, **kwargs):
-    if host == "api.dodopayments.com":
-        try:
-            import urllib.request
-            # resolve using Google DNS over HTTPS
-            url = f"https://dns.google/resolve?name={host}&type=A"
-            req = urllib.request.Request(url, headers={"accept": "application/dns-json"})
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                data = json.loads(resp.read())
-            ip = data["Answer"][0]["data"]
-            log.info(f"Resolved {host} via Google DoH -> {ip}")
-            return _original_getaddrinfo(ip, port, *args, **kwargs)
-        except Exception as e:
-            log.error(f"Google DoH resolution failed: {e}")
-    return _original_getaddrinfo(host, port, *args, **kwargs)
-
-socket.getaddrinfo = _patched_getaddrinfo
-
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
-
-
-def test_network():
-    log.info("=== NETWORK DIAGNOSTICS ===")
-    for host in ["api.dodopayments.com", "api.telegram.org", "google.com"]:
-        try:
-            ip = socket.gethostbyname(host)
-            log.info(f"DNS OK: {host} -> {ip}")
-        except Exception as e:
-            log.error(f"DNS FAILED: {host} -> {e}")
-    log.info("=== END DIAGNOSTICS ===")
+dodo = DodoPayments(bearer_token=DODO_API_KEY, environment=DODO_ENV)
 
 
 def init_db():
@@ -116,30 +82,32 @@ def set_status(subscription_id, status, expires_at=None):
     con.close()
 
 
-DODO_BASE = "https://api.dodopayments.com"
-
-
 def create_payment_link(telegram_id, username):
-    resp = requests.post(
-        f"{DODO_BASE}/subscriptions",
-        headers={"Authorization": f"Bearer {DODO_API_KEY}", "Content-Type": "application/json"},
-        json={
-            "product_id": DODO_PRODUCT_ID,
-            "quantity": 1,
-            "payment_link": True,
-            "metadata": {"telegram_id": str(telegram_id), "telegram_username": username or ""},
-            "return_url": "https://t.me/" + TELEGRAM_CHANNEL_ID.lstrip("@")
+    result = dodo.subscriptions.create(
+        billing={
+            "city": "",
+            "country": "IN",
+            "state": "",
+            "street": "",
+            "zipcode": ""
         },
-        timeout=15
+        customer={"email": f"tg_{telegram_id}@placeholder.com", "name": username or f"user_{telegram_id}"},
+        product_id=DODO_PRODUCT_ID,
+        quantity=1,
+        payment_link=True,
+        metadata={"telegram_id": str(telegram_id), "telegram_username": username or ""},
+        return_url="https://t.me/" + TELEGRAM_CHANNEL_ID.lstrip("@")
     )
-    resp.raise_for_status()
-    data = resp.json()
-    return data.get("payment_link") or data.get("url", "")
+    return result.payment_link or ""
 
 
 def verify_webhook_signature(raw_body, signature):
     expected = hmac.new(DODO_WEBHOOK_SECRET.encode(), raw_body, hashlib.sha256).hexdigest()
     return hmac.compare_digest(expected, signature.split("=")[-1])
+
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -304,7 +272,7 @@ def start_webhook_server():
 
 if __name__ == "__main__":
     init_db()
-    test_network()
+    log.info(f"Using Dodo environment: {DODO_ENV}")
     t = threading.Thread(target=start_webhook_server, daemon=True)
     t.start()
     bot_app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
