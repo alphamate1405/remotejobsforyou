@@ -14,7 +14,7 @@ DODO_API_KEY=IbXuTkXkJ0qy5Fng.U12rq_vBn2SuxtjaEiyF36VjXUIlu_02iNxRiso4_tqTLb0v
 DODO_PRODUCT_ID=pdt_0NbjouJDZNNdPAId0w9Qk
 
 # From Dodo dashboard → Webhooks → signing secret
-DODO_WEBHOOK_SECRET=pdt_0NbjouJDZNNdPAId0w9Qk
+DODO_WEBHOOK_SECRET=whsec_ztKx/CioMCRaZKWbvUF7v8/k4+YzgsmX
 
 # ── Server ────────────────────────────────────────────────
 # Port your webhook server listens on
