@@ -83,22 +83,13 @@ def set_status(subscription_id, status, expires_at=None):
 
 
 def create_payment_link(telegram_id, username):
-    result = dodo.subscriptions.create(
-        billing={
-            "city": "",
-            "country": "IN",
-            "state": "",
-            "street": "",
-            "zipcode": ""
-        },
-        customer={"email": f"tg_{telegram_id}@placeholder.com", "name": username or f"user_{telegram_id}"},
-        product_id=DODO_PRODUCT_ID,
-        quantity=1,
-        payment_link=True,
+    result = dodo.checkout_sessions.create(
+        product_cart=[{"product_id": DODO_PRODUCT_ID, "quantity": 1}],
         metadata={"telegram_id": str(telegram_id), "telegram_username": username or ""},
-        return_url="https://t.me/" + TELEGRAM_CHANNEL_ID.lstrip("@")
+        return_url="https://t.me/" + TELEGRAM_CHANNEL_ID.lstrip("@"),
+        subscription_data={}
     )
-    return result.payment_link or ""
+    return result.checkout_url or ""
 
 
 def verify_webhook_signature(raw_body, signature):
