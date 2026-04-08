@@ -10,6 +10,7 @@ import threading
 import requests
 import dodopayments
 from dodopayments import DodoPayments
+from standardwebhooks import Webhook
 
 TELEGRAM_BOT_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN")
 TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "@your_channel")
@@ -152,10 +153,13 @@ class WebhookHandler(BaseHTTPRequestHandler):
             return
         length = int(self.headers.get("Content-Length", 0))
         raw = self.rfile.read(length)
-        sig = self.headers.get("dodo-signature", "")
+        sig = self.headers.get("webhook-id", "")
         if DODO_WEBHOOK_SECRET != "YOUR_WEBHOOK_SECRET":
-            if not verify_webhook_signature(raw, sig):
-                log.warning("Bad webhook signature")
+            try:
+                wh = Webhook(DODO_WEBHOOK_SECRET)
+                wh.verify(raw, dict(self.headers))
+            except Exception as e:
+                log.warning(f"Bad webhook signature: {e}")
                 self.send_response(401)
                 self.end_headers()
                 return
@@ -232,13 +236,31 @@ def _send_message(chat_id, text):
 
 def _create_invite_and_send(telegram_id):
     try:
+        import time
+        unique_name = f"sub_{telegram_id}_{int(time.time())}"
         resp = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/createChatInviteLink",
-            json={"chat_id": TELEGRAM_CHANNEL_ID, "member_limit": 1, "name": f"sub_{telegram_id}"},
+            json={
+                "chat_id": TELEGRAM_CHANNEL_ID,
+                "name": unique_name,
+                "creates_join_request": False
+            },
             timeout=10
         )
-        invite = resp.json()["result"]["invite_link"]
-        _send_message(telegram_id, f"🔗 Your invite link:\n{invite}\n\n_Do not share this link._")
+        log.info(f"Invite link response: {resp.json()}")
+        result = resp.json().get("result", {})
+        invite = result.get("invite_link", "")
+        if invite:
+            _send_message(telegram_id,
+                f"🎉 *You are subscribed!*\n\n"
+                f"🔗 Click below to join the Jobs Channel:\n{invite}\n\n"
+                f"_This link is valid for you only._"
+            )
+        else:
+            log.error(f"No invite link in response: {resp.json()}")
+            _send_message(telegram_id,
+                "✅ Payment successful! Please contact support to get your channel access."
+            )
     except Exception as e:
         log.error(f"Invite link error: {e}")
 
@@ -264,6 +286,9 @@ def start_webhook_server():
 if __name__ == "__main__":
     init_db()
     log.info(f"Using Dodo environment: {DODO_ENV}")
+    log.info(f"API key first 10 chars: {DODO_API_KEY[:10]}")
+    log.info(f"API key length: {len(DODO_API_KEY)}")
+    log.info(f"API key last 5 chars: {DODO_API_KEY[-5:]}")
     t = threading.Thread(target=start_webhook_server, daemon=True)
     t.start()
     bot_app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
